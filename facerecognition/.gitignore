@@ -1,0 +1,59 @@
+### --- JAVA & MAVEN --- ###
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.log
+.mvn/wrapper/maven-wrapper.jar
+# Ignora arquivos de log do Spring
+logs/
+*.log.gz
+
+### --- PROJECT SPECIFIC (RECONHECIMENTO FACIAL) --- ###
+# Ignora a pasta onde as fotos dos rostos serão salvas
+# (Você não quer subir fotos de teste/usuários para o Git)
+faces/
+data/faces/
+captures/
+
+# Ignora o arquivo de treinamento do modelo (se gerado como .yml ou .xml)
+*.yml
+*.xml
+!src/main/resources/**/*.xml
+
+### --- IDEs --- ###
+# IntelliJ
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# Eclipse / STS
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# VS Code
+.vscode/
+.history/
+*.code-workspace
+
+# NetBeans
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+build/
+
+### --- OS TEMPORARY FILES --- ###
+.DS_Store
+Thumbs.db
+tmp/
+temp/
