@@ -1,65 +1,73 @@
 package com.example.facerecognition.service;
 
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
-import org.bytedeco.javacv.FrameGrabber;
 import org.bytedeco.javacv.OpenCVFrameGrabber;
 
 import org.springframework.stereotype.Service;
 
 @Service
 @Slf4j
+@Getter
 public class CameraService {
 
     private OpenCVFrameGrabber grabber;
 
-    public void startCamera() {
+    private boolean started = false;
+
+    // =====================================================
+    // START CAMERA
+    // =====================================================
+
+    public synchronized void startCamera() {
 
         try {
 
-            if (grabber != null) {
+            if (started) {
                 return;
             }
 
             grabber = new OpenCVFrameGrabber(0);
 
-            grabber.setImageWidth(640);
-            grabber.setImageHeight(480);
-
-            grabber.setFrameRate(30);
-
             grabber.start();
+
+            started = true;
 
             log.info("Webcam aberta.");
 
         } catch (Exception e) {
 
-            throw new RuntimeException(
-                    "Erro ao abrir webcam",
-                    e
-            );
+            log.error("Erro ao abrir webcam", e);
         }
     }
 
-    public OpenCVFrameGrabber getGrabber() {
-        return grabber;
-    }
+    // =====================================================
+    // STOP CAMERA
+    // =====================================================
 
-    public void stopCamera() {
+    public synchronized void stopCamera() {
 
         try {
+
+            if (!started) {
+                return;
+            }
+
+            started = false;
 
             if (grabber != null) {
 
                 grabber.stop();
+
                 grabber.release();
 
                 grabber = null;
-
-                log.info("Webcam fechada.");
             }
 
-        } catch (FrameGrabber.Exception e) {
+            log.info("Webcam fechada.");
+
+        } catch (Exception e) {
 
             log.error("Erro ao fechar webcam", e);
         }

@@ -2,6 +2,7 @@ package com.example.facerecognition.service;
 
 import com.example.facerecognition.model.Person;
 import com.example.facerecognition.repository.PersonRepository;
+import com.example.facerecognition.view.FaceRecognitionUI;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -9,7 +10,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.bytedeco.javacpp.DoublePointer;
 import org.bytedeco.javacpp.IntPointer;
 
-import org.bytedeco.javacv.*;
+import org.bytedeco.javacv.Frame;
+import org.bytedeco.javacv.Java2DFrameConverter;
+import org.bytedeco.javacv.OpenCVFrameConverter;
+import org.bytedeco.javacv.OpenCVFrameGrabber;
 
 import org.bytedeco.opencv.opencv_core.*;
 import org.bytedeco.opencv.opencv_face.LBPHFaceRecognizer;
@@ -17,9 +21,11 @@ import org.bytedeco.opencv.opencv_face.LBPHFaceRecognizer;
 import org.springframework.stereotype.Service;
 
 import javax.swing.*;
-import java.awt.event.KeyEvent;
+
+import java.awt.image.BufferedImage;
 
 import java.io.File;
+
 import java.nio.IntBuffer;
 
 import java.util.*;
@@ -36,7 +42,9 @@ import static org.bytedeco.opencv.global.opencv_imgproc.*;
 public class FaceRecognitionService {
 
     private final PersonRepository repository;
+
     private final FaceDetectionService detectionService;
+
     private final CameraService cameraService;
 
     private final ExecutorService executor =
@@ -45,9 +53,32 @@ public class FaceRecognitionService {
     private final Map<Integer, String> labelsMap =
             new HashMap<>();
 
+    private final FaceRecognitionUI ui =
+            new FaceRecognitionUI();
+
     private LBPHFaceRecognizer recognizer;
 
     private volatile boolean running = false;
+
+    private volatile boolean modelTrained = false;
+
+    private volatile boolean captureRequested = false;
+
+    private volatile boolean registerMode = false;
+
+    private String currentPose = "";
+
+    private int currentPoseIndex = 0;
+
+    private Person currentPerson;
+
+    private File currentPersonDir;
+
+    private static final String[] POSES = {
+            "Olhe para frente",
+            "Vire para esquerda",
+            "Vire para direita"
+    };
 
     private static final String DATASET_PATH =
             "data/faces/";
@@ -55,7 +86,10 @@ public class FaceRecognitionService {
     private static final int FACE_SIZE = 200;
 
     private static final double CONFIDENCE_THRESHOLD = 70;
-    private volatile boolean modelTrained = false;
+
+    private static final int DETECTION_INTERVAL = 3;
+
+    private static final int IMAGES_PER_POSE = 3;
 
     // =====================================================
     // START
@@ -67,9 +101,48 @@ public class FaceRecognitionService {
             return;
         }
 
+        configureUI();
+
         running = true;
 
+        SwingUtilities.invokeLater(() -> {
+
+            ui.setVisible(true);
+        });
+
         executor.submit(this::runCamera);
+    }
+
+    // =====================================================
+    // CONFIG UI
+    // =====================================================
+
+    private void configureUI() {
+
+        ui.getRegisterButton().addActionListener(e -> {
+
+            if (registerMode) {
+                return;
+            }
+
+            startRegisterFlow();
+        });
+
+        ui.getCaptureButton().addActionListener(e -> {
+
+            if (!registerMode) {
+                return;
+            }
+
+            captureRequested = true;
+        });
+
+        ui.getExitButton().addActionListener(e -> {
+
+            stopRecognition();
+        });
+
+        ui.getCaptureButton().setEnabled(false);
     }
 
     // =====================================================
@@ -78,15 +151,21 @@ public class FaceRecognitionService {
 
     public void stopRecognition() {
 
+        if (!running) {
+            return;
+        }
+
         running = false;
 
         cameraService.stopCamera();
 
-        log.info("Reconhecimento encerrado.");
+        SwingUtilities.invokeLater(ui::dispose);
+
+        log.info("Sistema encerrado.");
     }
 
     // =====================================================
-    // INIT LBPH
+    // INIT RECOGNIZER
     // =====================================================
 
     private void initializeRecognizer() {
@@ -103,195 +182,245 @@ public class FaceRecognitionService {
     }
 
     // =====================================================
-    // TREINAMENTO
+    // TRAIN MODEL
     // =====================================================
 
     private synchronized void trainModel() {
 
-    initializeRecognizer();
+        initializeRecognizer();
 
-    File datasetDir = new File(DATASET_PATH);
+        File datasetDir = new File(DATASET_PATH);
 
-    if (!datasetDir.exists()) {
-        datasetDir.mkdirs();
-    }
-
-    List<Person> persons = repository.findAll();
-
-    if (persons.isEmpty()) {
-
-        log.warn("Nenhuma pessoa cadastrada.");
-
-        modelTrained = false;
-
-        return;
-    }
-
-    MatVector photos = new MatVector();
-
-    List<Integer> labels = new ArrayList<>();
-
-    labelsMap.clear();
-
-    for (Person person : persons) {
-
-        Integer label = person.getLabel();
-
-        labelsMap.put(label, person.getName());
-
-        File personDir =
-                new File(DATASET_PATH + label);
-
-        if (!personDir.exists()) {
-            continue;
+        if (!datasetDir.exists()) {
+            datasetDir.mkdirs();
         }
 
-        File[] images = personDir.listFiles();
+        List<Person> persons = repository.findAll();
 
-        if (images == null) {
-            continue;
+        if (persons.isEmpty()) {
+
+            modelTrained = false;
+
+            log.warn("Nenhuma pessoa cadastrada.");
+
+            return;
         }
 
-        for (File img : images) {
+        MatVector photos = new MatVector();
 
-            Mat photo = imread(
-                    img.getAbsolutePath(),
-                    IMREAD_GRAYSCALE
-            );
+        List<Integer> labels = new ArrayList<>();
 
-            if (photo.empty()) {
+        labelsMap.clear();
+
+        for (Person person : persons) {
+
+            Integer label = person.getLabel();
+
+            labelsMap.put(label, person.getName());
+
+            File personDir =
+                    new File(DATASET_PATH + label);
+
+            if (!personDir.exists()) {
                 continue;
             }
 
-            resize(
-                    photo,
-                    photo,
-                    new Size(FACE_SIZE, FACE_SIZE)
-            );
+            File[] images = personDir.listFiles();
 
-            equalizeHist(photo, photo);
+            if (images == null) {
+                continue;
+            }
 
-            GaussianBlur(
-                    photo,
-                    photo,
-                    new Size(3, 3),
-                    0
-            );
+            for (File img : images) {
 
-            photos.push_back(photo);
+                Mat photo = imread(
+                        img.getAbsolutePath(),
+                        IMREAD_GRAYSCALE
+                );
 
-            labels.add(label);
+                if (photo.empty()) {
+                    continue;
+                }
+
+                resize(
+                        photo,
+                        photo,
+                        new Size(FACE_SIZE, FACE_SIZE)
+                );
+
+                equalizeHist(photo, photo);
+
+                photos.push_back(photo);
+
+                labels.add(label);
+            }
         }
-    }
 
-    if (photos.size() == 0) {
+        if (photos.size() == 0) {
 
-        log.warn("Nenhuma imagem válida.");
+            modelTrained = false;
 
-        modelTrained = false;
+            log.warn("Nenhuma imagem válida.");
 
-        return;
-    }
-
-    Mat labelsMat =
-            new Mat(labels.size(), 1, CV_32SC1);
-
-    IntBuffer buffer =
-            labelsMat.createBuffer();
-
-    for (int i = 0; i < labels.size(); i++) {
-        buffer.put(i, labels.get(i));
-    }
-
-    recognizer.train(photos, labelsMat);
-
-    modelTrained = true;
-
-    log.info(
-            "Modelo treinado com {} imagens.",
-            photos.size()
-    );
+            return;
         }
+
+        Mat labelsMat =
+                new Mat(labels.size(), 1, CV_32SC1);
+
+        IntBuffer buffer =
+                labelsMat.createBuffer();
+
+        for (int i = 0; i < labels.size(); i++) {
+
+            buffer.put(i, labels.get(i));
+        }
+
+        recognizer.train(photos, labelsMat);
+
+        modelTrained = true;
+
+        log.info(
+                "Modelo treinado com {} imagens.",
+                photos.size()
+        );
+    }
 
     // =====================================================
-    // LOOP CAMERA
+    // CAMERA LOOP
     // =====================================================
 
     private void runCamera() {
 
-        try {
+    OpenCVFrameGrabber grabber = null;
 
-            trainModel();
+    try {
 
-            cameraService.startCamera();
+        trainModel();
 
-            OpenCVFrameGrabber grabber =
-                    cameraService.getGrabber();
+        cameraService.startCamera();
 
-            OpenCVFrameConverter.ToMat converter =
-                    new OpenCVFrameConverter.ToMat();
+        grabber = cameraService.getGrabber();
 
-            CanvasFrame canvas =
-                    new CanvasFrame(
-                            "Reconhecimento Facial",
-                            CanvasFrame.getDefaultGamma() / 2.2
-                    );
+        if (grabber == null) {
 
-            canvas.setDefaultCloseOperation(
-                    JFrame.EXIT_ON_CLOSE
-            );
+            log.error("Webcam não inicializada.");
 
-            canvas.setAlwaysOnTop(true);
+            return;
+        }
 
-            log.info("Iniciando loop da câmera...");
+        OpenCVFrameConverter.ToMat converter =
+                new OpenCVFrameConverter.ToMat();
 
-            while (running && canvas.isVisible()) {
+        Java2DFrameConverter java2DConverter =
+                new Java2DFrameConverter();
 
-                Frame capturedFrame =
-                        grabber.grab();
+        RectVector detectedFaces =
+                new RectVector();
 
-                if (capturedFrame == null) {
+        int frameCounter = 0;
 
-                    log.warn("Frame nulo recebido.");
+        log.info("Loop da câmera iniciado.");
 
-                    continue;
+        while (running) {
+
+            Frame capturedFrame;
+
+            try {
+
+                capturedFrame = grabber.grab();
+
+            } catch (Exception e) {
+
+                if (!running) {
+                    break;
                 }
 
-                Mat frame =
-                        converter.convert(capturedFrame);
-
-                if (frame == null || frame.empty()) {
-
-                    log.warn("Frame vazio.");
-
-                    continue;
-                }
-
-                Mat gray = new Mat();
-
-                cvtColor(
-                        frame,
-                        gray,
-                        COLOR_BGR2GRAY
+                log.error(
+                        "Erro ao capturar frame.",
+                        e
                 );
 
-                RectVector faces =
+                break;
+            }
+
+            if (!running) {
+                break;
+            }
+
+            if (capturedFrame == null) {
+                continue;
+            }
+
+            Mat frame =
+                    converter.convert(capturedFrame);
+
+            if (frame == null || frame.empty()) {
+                continue;
+            }
+
+            Mat gray = new Mat();
+
+            cvtColor(
+                    frame,
+                    gray,
+                    COLOR_BGR2GRAY
+            );
+
+            frameCounter++;
+
+            // =====================================================
+            // DETECÇÃO OTIMIZADA
+            // =====================================================
+
+            if (frameCounter % DETECTION_INTERVAL == 0) {
+
+                detectedFaces =
                         detectionService.detect(gray);
+            }
 
-                for (int i = 0; i < faces.size(); i++) {
+            final int facesCount =
+                    (int) detectedFaces.size();
 
-                    Rect rect = faces.get(i);
+            final String statusText =
+                    registerMode
+                            ? currentPose
+                            : "Reconhecimento ativo";
 
-                    Mat face =
-                            new Mat(gray, rect);
+            SwingUtilities.invokeLater(() -> {
 
-                    resize(
-                            face,
-                            face,
-                            new Size(FACE_SIZE, FACE_SIZE)
-                    );
+                ui.updateFaceCount(facesCount);
 
-                    equalizeHist(face, face);
+                ui.updateStatus(statusText);
+            });
+
+            // =====================================================
+            // RECONHECIMENTO
+            // =====================================================
+
+            for (int i = 0; i < detectedFaces.size(); i++) {
+
+                Rect rect =
+                        detectedFaces.get(i);
+
+                Mat face =
+                        new Mat(gray, rect);
+
+                resize(
+                        face,
+                        face,
+                        new Size(FACE_SIZE, FACE_SIZE)
+                );
+
+                equalizeHist(face, face);
+
+                String detectedName =
+                        "Desconhecido";
+
+                Scalar color =
+                        new Scalar(0, 0, 255, 0);
+
+                if (modelTrained) {
 
                     IntPointer label =
                             new IntPointer(1);
@@ -299,176 +428,301 @@ public class FaceRecognitionService {
                     DoublePointer confidence =
                             new DoublePointer(1);
 
-                    String personName =
-                            "Desconhecido";
+                    recognizer.predict(
+                            face,
+                            label,
+                            confidence
+                    );
 
-                    Scalar color =
-                            new Scalar(0, 0, 255, 0);
+                    int predicted =
+                            label.get(0);
 
-                    if (modelTrained) {
+                    double conf =
+                            confidence.get(0);
 
-                        recognizer.predict(
-                                face,
-                                label,
-                                confidence
-                        );
+                    if (conf < CONFIDENCE_THRESHOLD) {
 
-                        int predicted =
-                                label.get(0);
+                        detectedName =
+                                labelsMap.getOrDefault(
+                                        predicted,
+                                        "Desconhecido"
+                                );
 
-                        double conf =
-                                confidence.get(0);
+                        detectedName +=
+                                " | " +
+                                String.format(
+                                        "%.2f",
+                                        conf
+                                );
 
-                        if (conf < CONFIDENCE_THRESHOLD) {
-
-                            personName =
-                                    labelsMap.getOrDefault(
-                                            predicted,
-                                            "Desconhecido"
-                                    );
-
-                            personName +=
-                                    " | " +
-                                    String.format("%.2f", conf);
-
-                            color =
-                                    new Scalar(0, 255, 0, 0);
-                        }
+                        color =
+                                new Scalar(
+                                        0,
+                                        255,
+                                        0,
+                                        0
+                                );
                     }
-
-                    rectangle(
-                            frame,
-                            rect,
-                            color,
-                            2,
-                            LINE_8,
-                            0
-                    );
-
-                    putText(
-                            frame,
-                            personName,
-                            new Point(
-                                    rect.x(),
-                                    rect.y() - 10
-                            ),
-                            FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            color
-                    );
                 }
 
-                canvas.showImage(
-                        converter.convert(frame)
+                final String finalDetectedName =
+                        detectedName;
+
+                SwingUtilities.invokeLater(() -> {
+
+                    ui.updateDetectedPerson(
+                            finalDetectedName
+                    );
+                });
+
+                rectangle(
+                        frame,
+                        rect,
+                        color,
+                        2,
+                        LINE_8,
+                        0
                 );
 
-                KeyEvent key = null;
-
-                try {
-
-                    key = canvas.waitKey(20);
-
-                } catch (InterruptedException e) {
-
-                    Thread.currentThread().interrupt();
-
-                    running = false;
-                }
-
-                if (key != null &&
-                        key.getKeyCode() == KeyEvent.VK_C) {
-
-                    registerNewFace(gray, faces);
-                }
-
-                if (key != null &&
-                        key.getKeyCode() == KeyEvent.VK_Q) {
-
-                    running = false;
-                }
+                putText(
+                        frame,
+                        detectedName,
+                        new Point(
+                                rect.x(),
+                                rect.y() - 10
+                        ),
+                        FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        color
+                );
             }
 
-            canvas.dispose();
+            // =====================================================
+            // CAPTURA GUIADA
+            // =====================================================
+
+            if (registerMode
+                    && captureRequested
+                    && detectedFaces.size() > 0) {
+
+                captureRequested = false;
+
+                Rect rect =
+                        detectedFaces.get(0);
+
+                capturePoseImages(
+                        gray,
+                        rect
+                );
+            }
+
+            // =====================================================
+            // ATUALIZA UI
+            // =====================================================
+
+            Frame uiFrame =
+                    converter.convert(frame);
+
+            BufferedImage image =
+                    java2DConverter.getBufferedImage(
+                            uiFrame
+                    );
+
+            SwingUtilities.invokeLater(() -> {
+
+                ui.updateCamera(image);
+            });
+
+            // =====================================================
+            // PEQUENO DELAY
+            // =====================================================
+
+            Thread.sleep(15);
+        }
+
+    } catch (Exception e) {
+
+        log.error("Erro na câmera", e);
+
+    } finally {
+
+        running = false;
+
+        try {
 
             cameraService.stopCamera();
 
-        } catch (Exception e) {
-
-            log.error("Erro na câmera", e);
+        } catch (Exception ignored) {
         }
+
+        SwingUtilities.invokeLater(() -> {
+
+            ui.dispose();
+        });
+
+        log.info("Thread da câmera encerrada.");
     }
+}
 
     // =====================================================
-    // CADASTRO
+    // START REGISTER
     // =====================================================
 
-    private synchronized void registerNewFace(
-            Mat gray,
-            RectVector faces
-    ) {
-
-        if (faces.size() == 0) {
-            return;
-        }
+    private void startRegisterFlow() {
 
         String name =
                 JOptionPane.showInputDialog(
-                        "Nome:"
+                        null,
+                        "Digite o nome da pessoa"
                 );
 
         if (name == null || name.isBlank()) {
             return;
         }
 
-        Person person = repository.save(
-                Person.builder()
-                        .name(name)
-                        .build()
-        );
+        currentPerson =
+                repository.save(
+                        Person.builder()
+                                .name(name)
+                                .build()
+                );
 
         Integer label =
-                person.getId().intValue();
+                currentPerson.getId().intValue();
 
-        person.setLabel(label);
+        currentPerson.setLabel(label);
 
-        repository.save(person);
+        repository.save(currentPerson);
 
-        File personDir =
+        currentPersonDir =
                 new File(DATASET_PATH + label);
 
-        personDir.mkdirs();
+        currentPersonDir.mkdirs();
 
-        Rect rect = faces.get(0);
+        currentPoseIndex = 0;
 
-        for (int i = 0; i < 15; i++) {
+        currentPose = POSES[currentPoseIndex];
 
-            Mat face =
-                    new Mat(gray, rect);
+        registerMode = true;
 
-            resize(
-                    face,
-                    face,
-                    new Size(FACE_SIZE, FACE_SIZE)
-            );
+        ui.getCaptureButton().setEnabled(true);
 
-            equalizeHist(face, face);
+        ui.updateStatus(currentPose);
 
-            String path =
-                    personDir.getAbsolutePath()
-                            + "/"
-                            + UUID.randomUUID()
-                            + ".jpg";
-
-            imwrite(path, face);
-        }
-
-        labelsMap.put(label, name);
-
-        trainModel();
-
-        log.info("Pessoa cadastrada: {}", name);
+        log.info(
+                "Cadastro iniciado: {}",
+                name
+        );
     }
 
-    
+    // =====================================================
+    // CAPTURE IMAGES
+    // =====================================================
 
+    private synchronized void capturePoseImages(
+            Mat gray,
+            Rect rect
+    ) {
+
+        try {
+
+            for (int i = 0; i < IMAGES_PER_POSE; i++) {
+
+                Mat face =
+                        new Mat(gray, rect);
+
+                resize(
+                        face,
+                        face,
+                        new Size(FACE_SIZE, FACE_SIZE)
+                );
+
+                equalizeHist(face, face);
+
+                GaussianBlur(
+                        face,
+                        face,
+                        new Size(3, 3),
+                        0
+                );
+
+                String path =
+                        currentPersonDir.getAbsolutePath()
+                                + "/"
+                                + currentPose.replace(" ", "_")
+                                + "_"
+                                + UUID.randomUUID()
+                                + ".jpg";
+
+                imwrite(path, face);
+
+                log.info(
+                        "Imagem salva: {}",
+                        path
+                );
+
+                Thread.sleep(400);
+            }
+
+            currentPoseIndex++;
+
+            // =====================================================
+            // NEXT POSE
+            // =====================================================
+
+            if (currentPoseIndex < POSES.length) {
+
+                currentPose =
+                        POSES[currentPoseIndex];
+
+                SwingUtilities.invokeLater(() -> {
+
+                    ui.updateStatus(currentPose);
+
+                    JOptionPane.showMessageDialog(
+                            null,
+                            currentPose
+                    );
+                });
+
+            } else {
+
+                registerMode = false;
+
+                ui.getCaptureButton()
+                        .setEnabled(false);
+
+                ui.updateStatus(
+                        "Treinando modelo..."
+                );
+
+                new Thread(() -> {
+
+                    trainModel();
+
+                    SwingUtilities.invokeLater(() -> {
+
+                        ui.updateStatus(
+                                "Reconhecimento ativo"
+                        );
+
+                        JOptionPane.showMessageDialog(
+                                null,
+                                "Cadastro concluído!"
+                        );
+                    });
+
+                }).start();
+
+                log.info("Cadastro concluído.");
+            }
+
+        } catch (Exception e) {
+
+            log.error(
+                    "Erro ao capturar imagem",
+                    e
+            );
+        }
+    }
 }
